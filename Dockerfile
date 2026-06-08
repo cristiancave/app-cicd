@@ -4,10 +4,10 @@ EXPOSE 8080
 
 FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
 WORKDIR /src
-COPY  AppCicd/AppCicd.csproj ./
-RUN dotnet restore
-COPY AppCicd/ ./
-RUN dotnet publish -c Release -o /app/publish
+COPY AppCicd/AppCicd.csproj AppCicd/
+RUN dotnet restore AppCicd/AppCicd.csproj
+COPY AppCicd/ AppCicd/
+RUN dotnet publish AppCicd/AppCicd.csproj -c Release -o /app/publish --no-restore
 
 FROM base AS final
 WORKDIR /app
