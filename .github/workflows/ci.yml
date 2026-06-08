@@ -26,15 +26,48 @@ jobs:
       - name: Code format check
         run: dotnet format --verify-no-changes
 
+      - name: Build Docker image
+        run: docker build -t cristiancave/app-cicd:latest .
+
+      - name: Security scan with Grype
+        uses: anchore/scan-action@v6
+        with:
+          image: cristiancave/app-cicd:latest
+          fail-build: true
+          severity-cutoff: critical
+
       - name: Login to Docker Hub
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v6
+      - name: Push Docker image
+        run: docker push cristiancave/app-cicd:latest
+
+  deploy-to-aks:
+    needs: build-and-test
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
         with:
-          context: .
-          push: true
-          tags: cristiancave/app-cicd:latest
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Get AKS credentials
+        run: az aks get-credentials --resource-group rg-appcicd-dev-eastus --name aks-appcicd-dev
+
+      - name: Deploy to AKS
+        run: |
+          kubectl set image deployment/app-cicd app-cicd=cristiancave/app-cicd:latest
+          kubectl rollout restart deployment/app-cicd
+          kubectl rollout status deployment/app-cicd
