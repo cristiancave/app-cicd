@@ -7,7 +7,7 @@ WORKDIR /src
 COPY AppCicd/AppCicd.csproj AppCicd/
 RUN dotnet restore AppCicd/AppCicd.csproj
 COPY AppCicd/ AppCicd/
-RUN dotnet publish AppCicd/AppCicd.csproj -c Release -o /app/publish --no-restore
+RUN dotnet publish AppCicd/AppCicd.csproj -c Release -o /app/publish
 
 FROM base AS final
 WORKDIR /app
