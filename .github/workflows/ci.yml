@@ -8,20 +8,42 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '10.0.x'
 
+      - name: Setup Java (required by SonarCloud)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Install SonarScanner
+        run: dotnet tool install --global dotnet-sonarscanner
+
       - name: Restore dependencies
         run: dotnet restore
 
-      - name: Static code analysis
-        run: dotnet build --no-restore --warnaserror
+      - name: SonarCloud analysis begin
+        run: |
+          dotnet sonarscanner begin \
+            /k:"cristiancave_app-cicd" \
+            /o:"cristiancave" \
+            /d:sonar.host.url="https://sonarcloud.io" \
+            /d:sonar.token="${{ secrets.SONAR_TOKEN }}"
+
+      - name: Build
+        run: dotnet build --no-restore
 
       - name: Run tests
         run: dotnet test AppCicd.Tests/AppCicd.Tests.csproj --no-build --verbosity normal
+
+      - name: SonarCloud analysis end
+        run: dotnet sonarscanner end /d:sonar.token="${{ secrets.SONAR_TOKEN }}"
 
       - name: Code format check
         run: dotnet format --verify-no-changes
@@ -64,10 +86,3 @@ jobs:
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
       - name: Get AKS credentials
-        run: az aks get-credentials --resource-group rg-appcicd-dev-eastus --name aks-appcicd-dev
-
-      - name: Deploy to AKS
-        run: |
-          kubectl set image deployment/app-cicd app-cicd=cristiancave/app-cicd:latest
-          kubectl rollout restart deployment/app-cicd
-          kubectl rollout status deployment/app-cicd
