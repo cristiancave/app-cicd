@@ -1,5 +1,6 @@
 using AppCicd.Models;
 using Microsoft.OpenApi.Models;
+using Prometheus;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -18,6 +19,9 @@ var app = builder.Build();
 
 app.UseSwagger();
 app.UseSwaggerUI(options => options.SwaggerEndpoint("/swagger/v1/swagger.json", "Library Management API v1"));
+
+app.UseHttpMetrics();
+app.MapMetrics();
 
 var books = new List<Book>();
 var loans = new List<Loan>();
