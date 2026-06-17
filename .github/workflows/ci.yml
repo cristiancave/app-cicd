@@ -27,6 +27,13 @@ jobs:
       - name: Restore dependencies
         run: dotnet restore
 
+      - name: Snyk dependency scan
+        uses: snyk/actions/dotnet@master
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --file=AppCicd/AppCicd.csproj --severity-threshold=critical
+
       - name: SonarCloud begin
         run: dotnet sonarscanner begin /k:"cristiancave_app-cicd" /o:"cristiancave" /d:sonar.host.url="https://sonarcloud.io" /d:sonar.token="${{ secrets.SONAR_TOKEN }}"
 
