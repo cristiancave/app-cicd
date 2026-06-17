@@ -31,7 +31,7 @@ jobs:
         run: npm install -g snyk
 
       - name: Snyk dependency scan
-        run: snyk test --file=AppCicd/AppCicd.csproj --severity-threshold=critical --detection-depth=2
+        run: cd AppCicd && snyk test --severity-threshold=critical
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
