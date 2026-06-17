@@ -12,11 +12,12 @@ La API simula un sistema de gestión de biblioteca que permite administrar libro
 
 ### Endpoints disponibles
 
-**Health Check:**
+**Health Check y Observabilidad:**
 | Método | Endpoint | Descripción |
 |---|---|---|
 | `GET` | `/health` | Estado de la aplicación. Usado por Kubernetes para readiness y liveness probes |
 | `GET` | `/swagger` | Documentación interactiva OpenAPI (Swagger UI) |
+| `GET` | `/metrics` | Métricas Prometheus (http_requests_received_total, http_request_duration_seconds, etc.) |
 
 **Libros:**
 | Método | Endpoint | Descripción |
@@ -51,14 +52,66 @@ La API simula un sistema de gestión de biblioteca que permite administrar libro
 - Al devolver un libro, `availableCopies` se **incrementa**, `returnDate` se registra y `status` cambia a `Returned`.
 - El endpoint `/api/loans/overdue` compara `dueDate` con la fecha actual para detectar préstamos vencidos que aún no se han devuelto.
 
+## Observabilidad y SLOs
+
+La aplicación expone métricas Prometheus estándar mediante el paquete `prometheus-net.AspNetCore`. El endpoint `/metrics` es scrapeado automáticamente por Azure Monitor managed Prometheus cada 30 segundos.
+
+### Métricas expuestas
+
+El endpoint `/metrics` expone automáticamente:
+
+| Métrica | Tipo | Descripción |
+|---|---|---|
+| `http_requests_received_total` | Counter | Total de peticiones HTTP recibidas, etiquetadas por método, endpoint y código de respuesta |
+| `http_request_duration_seconds` | Histogram | Duración de cada petición en segundos (incluye percentiles p50, p90, p95, p99) |
+| `http_requests_in_progress` | Gauge | Peticiones siendo procesadas en este momento |
+
+### SLOs definidos
+
+Se definieron 3 Service Level Objectives para monitorear la salud de la aplicación en producción:
+
+| SLO | Objetivo | Descripción |
+|---|---|---|
+| **Disponibilidad** | ≥ 99.5% | Tasa de respuestas exitosas (2xx) sobre el total de peticiones |
+| **Error rate** | ≤ 0.5% | Tasa de respuestas con error de servidor (5xx) |
+| **Latencia p95** | ≤ 500ms | El 95% de las peticiones deben responder en menos de 500 milisegundos |
+
+### Integración con Prometheus
+
+La aplicación expone métricas con solo dos líneas de código en `Program.cs`:
+
+```csharp
+app.UseHttpMetrics();   // Intercepta cada petición y registra métricas
+app.MapMetrics();       // Expone el endpoint /metrics en formato Prometheus
+```
+
+El paquete `prometheus-net.AspNetCore` se encarga del resto: instrumenta automáticamente cada endpoint y genera las métricas estándar que Azure Monitor Prometheus recolecta.
+
+### Implementación
+
+```
+App .NET (4 pods)
+    ↓ expone /metrics
+Azure Monitor managed Prometheus (PodMonitor scrape cada 30s)
+    ↓
+Prometheus Rule Groups (Bicep)
+    ├── 4 Recording rules (precálculos SLI)
+    └── 3 Alerting rules (disparan cuando se violan SLOs)
+    ↓
+Azure Managed Grafana
+    └── Dashboard SLO con 7 paneles visuales
+```
+
+Para más detalles sobre la infraestructura de observabilidad (PodMonitor, Bicep rules, dashboard Grafana), ver el repo [app-cicd-infra](https://github.com/cristiancave/app-cicd-infra).
+
 ## Estructura del repositorio
 
 ```
 app-cicd/
 ├── AppCicd/                       # Código fuente de la API
-│   ├── Program.cs                 # Endpoints Minimal API + Swagger
+│   ├── Program.cs                 # Endpoints Minimal API + Swagger + Prometheus metrics
 │   ├── Models/                    # Modelos de datos (Book, Loan, Enums)
-│   ├── AppCicd.csproj             # Proyecto .NET con analizadores Roslyn
+│   ├── AppCicd.csproj             # Proyecto .NET con analizadores Roslyn + prometheus-net
 │   └── appsettings.json           # Configuración de la aplicación
 ├── AppCicd.Tests/                 # Pruebas unitarias y de integración
 │   ├── *Tests.cs                  # Tests con xUnit + WebApplicationFactory
@@ -81,37 +134,41 @@ flowchart LR
     subgraph "Job 1: build-and-test (CI)"
         A[Checkout] --> B[Setup .NET]
         B --> C[Restore]
-        C --> D[Static analysis]
-        D --> E[Run tests]
-        E --> F[Format check]
-        F --> G[Build image]
-        G --> H[Grype scan]
-        H --> I[Push to Docker Hub]
+        C --> D[SonarCloud begin]
+        D --> E[Build + analysis]
+        E --> F[Run tests + coverage]
+        F --> G[SonarCloud end]
+        G --> H[Format check]
+        H --> I[Build image]
+        I --> J[Grype scan]
+        J --> K[Push to Docker Hub]
     end
 
     subgraph "Job 2: deploy-to-aks (CD)"
-        J[Azure login OIDC] --> K[Get AKS credentials]
-        K --> L[Deploy + rollout]
+        L[Azure login OIDC] --> M[Get AKS credentials]
+        M --> N[Deploy + rollout]
     end
 
-    I -->|"Solo en main"| J
+    K -->|"Solo en main"| L
 ```
 
 ### Job 1: build-and-test (CI)
 
-Se ejecuta en **cada push y pull request**. Incluye 9 steps:
+Se ejecuta en **cada push y pull request**:
 
 | Step | Qué hace | Por qué es importante |
 |---|---|---|
-| **Checkout** | Descarga el código del repositorio | Punto de partida de todo pipeline |
-| **Setup .NET** | Instala el SDK de .NET 10 en el runner | El runner de GitHub no tiene .NET preinstalado |
-| **Restore dependencies** | Descarga paquetes NuGet | Separado del build para aprovechar cache |
-| **Static code analysis** | Compila con `--warnaserror` + analizadores Roslyn | Detecta bugs potenciales, code smells y vulnerabilidades en tiempo de compilación. `TreatWarningsAsErrors` garantiza que ningún warning llega a producción |
-| **Run tests** | Ejecuta pruebas con xUnit | Valida que la lógica de negocio funciona correctamente. Incluye pruebas de integración con `WebApplicationFactory` que levantan la API en memoria |
-| **Code format check** | Verifica formato con `dotnet format --verify-no-changes` | Asegura consistencia de estilo en todo el código. Si alguien sube código mal formateado, el pipeline falla |
-| **Build Docker image** | Construye la imagen con multi-stage build | Genera la imagen que se va a desplegar. Multi-stage reduce el tamaño final de ~800MB (SDK) a ~200MB (runtime) |
-| **Security scan (Grype)** | Escanea la imagen Docker buscando vulnerabilidades | Detecta CVEs conocidos en la imagen base y dependencias. Si encuentra vulnerabilidades críticas, el pipeline falla y la imagen no se publica |
-| **Push to Docker Hub** | Publica la imagen en el registro | Solo se ejecuta si todos los pasos anteriores pasaron, incluyendo el escaneo de seguridad |
+| **Checkout** | Descarga el código con historial completo | SonarCloud necesita el historial para análisis incremental |
+| **Setup .NET + Java** | Instala SDK .NET 10 y Java 17 | SonarScanner requiere Java para ejecutarse |
+| **Restore** | Descarga paquetes NuGet | Separado del build para aprovechar cache |
+| **SonarCloud begin** | Inicia análisis estático con SonarCloud | Envuelve el build para capturar información de análisis |
+| **Build** | Compila con analizadores Roslyn y --warnaserror | Detecta bugs, code smells y vulnerabilidades en compilación |
+| **Run tests + coverage** | Pruebas con xUnit y reporte de cobertura OpenCover | Valida lógica de negocio y mide cobertura de código |
+| **SonarCloud end** | Cierra y sube resultados a SonarCloud | Dashboard de calidad en sonarcloud.io |
+| **Format check** | Verifica formato con dotnet format | Asegura consistencia de estilo |
+| **Build image** | Construye imagen Docker multi-stage | Imagen final ~200MB vs ~800MB con SDK |
+| **Grype scan** | Escanea imagen por CVEs | Si encuentra vulnerabilidades críticas, la imagen no se publica |
+| **Push to Docker Hub** | Publica la imagen | Solo si todos los pasos anteriores pasaron |
 
 ### Job 2: deploy-to-aks (CD)
 
@@ -119,13 +176,13 @@ Se ejecuta **solo en la rama `main`** y solo si el Job 1 fue exitoso:
 
 | Step | Qué hace | Por qué es importante |
 |---|---|---|
-| **Azure login (OIDC)** | Se autentica en Azure sin contraseñas | Usa credenciales federadas: GitHub presenta un token temporal y Azure lo valida contra la relación de confianza configurada. No hay secretos almacenados |
-| **Get AKS credentials** | Descarga el kubeconfig del cluster | Permite ejecutar comandos `kubectl` contra el cluster AKS |
-| **Deploy to AKS** | Actualiza la imagen y reinicia los pods | `kubectl set image` cambia la imagen del deployment, `kubectl rollout restart` fuerza la actualización, `kubectl rollout status` espera confirmación |
+| **Azure login (OIDC)** | Se autentica en Azure sin contraseñas | Credenciales federadas: token temporal, sin secretos almacenados |
+| **Get AKS credentials** | Descarga el kubeconfig del cluster | Permite ejecutar comandos kubectl |
+| **Deploy to AKS** | Actualiza imagen y reinicia los pods | kubectl set image + rollout restart + rollout status |
 
 ### ¿Por qué Grype y no Trivy?
 
-En marzo de 2026, Trivy (Aqua Security) sufrió un ataque a la cadena de suministro (CVE-2026-33634) que comprometió GitHub Actions, binarios de release e imágenes Docker Hub. Los atacantes inyectaron malware que exfiltraba credenciales de CI/CD (tokens, SSH keys, Kubernetes tokens) desde los runners. Se seleccionó **Grype** (Anchore) como alternativa segura y open source para el escaneo de vulnerabilidades de imágenes Docker.
+En marzo de 2026, Trivy (Aqua Security) sufrió un ataque a la cadena de suministro (CVE-2026-33634) que comprometió GitHub Actions, binarios de release e imágenes Docker Hub. Los atacantes inyectaron malware que exfiltraba credenciales de CI/CD desde los runners. Se seleccionó **Grype** (Anchore) como alternativa segura.
 
 ## Dockerfile
 
@@ -137,14 +194,14 @@ Stage 2 (final):  Runtime ~200MB → Solo copia los binarios compilados
 ```
 
 Beneficios:
-- **Imagen final ~75% más pequeña** que si incluyera el SDK completo.
-- **Sin código fuente** en la imagen final, solo binarios compilados. Más seguro.
-- **Sin herramientas de desarrollo** (compilador, debugger) que podrían ser explotadas.
-- **Cache de capas:** se copia primero el `.csproj` y se restauran dependencias antes de copiar el código. Si las dependencias no cambian, Docker usa cache y el build es más rápido.
+- Imagen final ~75% más pequeña que si incluyera el SDK completo.
+- Sin código fuente en la imagen final, solo binarios compilados.
+- Sin herramientas de desarrollo que podrían ser explotadas.
+- Cache de capas: copia primero el .csproj para aprovechar cache de dependencias.
 
 ## Pruebas
 
-El proyecto incluye pruebas de integración con **xUnit** y **WebApplicationFactory** que levantan la API en memoria y ejecutan peticiones HTTP reales contra ella:
+Pruebas de integración con **xUnit** y **WebApplicationFactory**:
 
 - Health check retorna 200 OK
 - CRUD completo de libros (crear, leer, actualizar, eliminar)
@@ -155,31 +212,34 @@ El proyecto incluye pruebas de integración con **xUnit** y **WebApplicationFact
 - Filtro de préstamos activos y vencidos
 - Estadísticas retornan datos correctos
 
-Los tests se ejecutan automáticamente en cada push como parte del pipeline CI.
+Los tests se ejecutan automáticamente en cada push con reporte de cobertura enviado a SonarCloud.
 
 ## Análisis estático de código
 
-El proyecto tiene habilitados los analizadores de Roslyn de .NET con la configuración más estricta:
+Se utilizan dos herramientas complementarias:
 
+**Analizadores Roslyn (.NET nativo):**
 ```xml
 <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
 <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
 <AnalysisLevel>latest-recommended</AnalysisLevel>
 ```
 
-- **TreatWarningsAsErrors:** cualquier warning se convierte en error de compilación. No se permite código con warnings en producción.
-- **EnforceCodeStyleInBuild:** verifica naming conventions y estilo durante la compilación.
-- **AnalysisLevel latest-recommended:** activa todos los analizadores recomendados por Microsoft para detectar bugs, vulnerabilidades y malas prácticas.
+**SonarCloud (análisis en la nube):**
+- Detecta bugs, vulnerabilidades, code smells y duplicación
+- Mide cobertura de código con reportes OpenCover
+- Dashboard público en sonarcloud.io con Quality Gate
 
 ## Despliegue en AKS
 
 La aplicación corre en Azure Kubernetes Service con la siguiente configuración:
 
-- **2 réplicas** para alta disponibilidad
-- **Readiness probe** en `/health` — Kubernetes verifica que el pod está listo antes de enviarle tráfico
-- **Liveness probe** en `/health` — si el pod deja de responder, Kubernetes lo reinicia automáticamente
-- **Resource limits** — cada pod tiene CPU y memoria limitados para evitar que un pod defectuoso afecte a los demás
-- **LoadBalancer** — Azure asigna una IP pública para acceso desde internet
+- **4 réplicas** para alta disponibilidad y distribución de carga
+- **Readiness probe** en `/health` — Kubernetes verifica que el pod esté listo antes de enviarle tráfico
+- **Liveness probe** en `/health` — si el pod deja de responder, Kubernetes lo reinicia
+- **Resource limits** — cada pod tiene CPU y memoria limitados
+- **LoadBalancer** — Azure asigna una IP pública
+- **Puerto nombrado `http`** — requerido por el PodMonitor para scraping de métricas
 
 ### Acceso a la aplicación
 
@@ -187,6 +247,7 @@ La aplicación corre en Azure Kubernetes Service con la siguiente configuración
 http://<EXTERNAL-IP>/health         # Health check
 http://<EXTERNAL-IP>/swagger        # Documentación interactiva
 http://<EXTERNAL-IP>/api/books      # API de libros
+http://<EXTERNAL-IP>/metrics        # Métricas Prometheus
 ```
 
 Para obtener la IP actual:
@@ -197,7 +258,6 @@ kubectl get service app-cicd-service
 ## Ejecución local
 
 ### Con .NET directamente
-
 ```bash
 cd AppCicd/
 dotnet run
@@ -205,7 +265,6 @@ dotnet run
 ```
 
 ### Con Docker
-
 ```bash
 docker build -t app-cicd:local .
 docker run -p 8080:8080 app-cicd:local
@@ -213,7 +272,6 @@ docker run -p 8080:8080 app-cicd:local
 ```
 
 ### Ejecutar pruebas
-
 ```bash
 dotnet test AppCicd.Tests/AppCicd.Tests.csproj --verbosity normal
 ```
@@ -222,29 +280,34 @@ dotnet test AppCicd.Tests/AppCicd.Tests.csproj --verbosity normal
 
 | Capa | Mecanismo | Descripción |
 |---|---|---|
-| **Código** | Analizadores Roslyn | Detección de bugs y vulnerabilidades en compilación |
-| **Formato** | dotnet format | Consistencia de estilo, previene errores de legibilidad |
+| **Código** | Analizadores Roslyn + SonarCloud | Detección de bugs, vulnerabilidades y code smells |
+| **Formato** | dotnet format | Consistencia de estilo |
 | **Imagen Docker** | Grype (Anchore) | Escaneo de CVEs en imagen base y dependencias |
-| **Autenticación Azure** | OIDC Federation | Tokens temporales, sin contraseñas almacenadas en GitHub |
+| **Autenticación Azure** | OIDC Federation | Tokens temporales, sin contraseñas almacenadas |
 | **Service Principal** | RBAC (Contributor) | Menor privilegio, limitado a la suscripción |
-| **Secretos Docker Hub** | GitHub Secrets | `DOCKERHUB_USERNAME` y `DOCKERHUB_TOKEN` encriptados por GitHub |
-| **Kubernetes** | Probes + Resource limits | Self-healing y aislamiento de recursos entre pods |
+| **Secretos** | GitHub Secrets + Azure Key Vault | Encriptados, nunca en código |
+| **Kubernetes** | Probes + Resource limits | Self-healing y aislamiento de recursos |
+| **Monitoreo** | SLOs + Alertas Prometheus | Detección proactiva de degradación del servicio |
 
 ## Tecnologías
 
 | Tecnología | Versión | Propósito |
 |---|---|---|
 | .NET | 10.0 | Framework de la API (Minimal APIs) |
+| prometheus-net | - | Exposición de métricas Prometheus |
 | xUnit | - | Framework de pruebas |
 | Docker | Multi-stage | Contenerización de la aplicación |
 | GitHub Actions | v6 | Pipeline CI/CD automatizado |
+| SonarCloud | - | Análisis estático y cobertura de código |
 | Grype | v6 | Escaneo de vulnerabilidades de imágenes |
-| Azure AKS | Kubernetes 1.34 | Orquestación de contenedores en producción |
-| OIDC | Federation | Autenticación sin secretos entre GitHub y Azure |
+| Azure AKS | Kubernetes 1.34 | Orquestación de contenedores |
+| Azure Monitor Prometheus | Managed | Recolección y almacenamiento de métricas |
+| Azure Managed Grafana | - | Dashboards de monitoreo y SLOs |
+| OIDC | Federation | Autenticación sin secretos |
 
 ## Repositorio relacionado
 
 | Repositorio | Responsabilidad |
 |---|---|
-| [app-cicd](https://github.com/cristiancave/app-cicd) | Código fuente, Dockerfile, CI (GitHub Actions), CD automatizado a AKS |
-| [app-cicd-infra](https://github.com/cristiancave/app-cicd-infra) | Terraform (IaC), manifiestos Kubernetes, Jenkins pipeline, Key Vault |
+| [app-cicd](https://github.com/cristiancave/app-cicd) | Código fuente, Dockerfile, CI/CD (GitHub Actions), métricas Prometheus |
+| [app-cicd-infra](https://github.com/cristiancave/app-cicd-infra) | Terraform, K8s manifests, Bicep (SLO rules), Grafana dashboard, Jenkins |
