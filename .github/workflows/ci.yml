@@ -28,7 +28,7 @@ jobs:
         run: dotnet restore
 
       - name: Install Snyk CLI
-        run: npm install -g snyk
+        run: npm install -g snyk --ignore-scripts
 
       - name: Snyk dependency scan
         run: cd AppCicd && snyk test --severity-threshold=critical
