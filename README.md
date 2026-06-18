@@ -5,6 +5,7 @@ API de gestión de biblioteca (Library Management) construida con .NET 10, despl
 [![CI/CD](https://github.com/cristiancave/app-cicd/actions/workflows/ci.yml/badge.svg)](https://github.com/cristiancave/app-cicd/actions/workflows/ci.yml)
 [![Docker Hub](https://img.shields.io/badge/Docker%20Hub-cristiancave%2Fapp--cicd-2496ED?logo=docker&logoColor=white)](https://hub.docker.com/r/cristiancave/app-cicd)
 [![Kubernetes](https://img.shields.io/badge/Deployed%20on-Azure%20AKS-326CE5?logo=kubernetes&logoColor=white)](#despliegue-en-aks)
+[![Snyk](https://img.shields.io/badge/Snyk-Dependency%20Scan-4C4A73?logo=snyk&logoColor=white)](https://app.snyk.io)
 
 ## La aplicación
 
@@ -134,22 +135,23 @@ flowchart LR
     subgraph "Job 1: build-and-test (CI)"
         A[Checkout] --> B[Setup .NET]
         B --> C[Restore]
-        C --> D[SonarCloud begin]
-        D --> E[Build + analysis]
-        E --> F[Run tests + coverage]
-        F --> G[SonarCloud end]
-        G --> H[Format check]
-        H --> I[Build image]
-        I --> J[Grype scan]
-        J --> K[Push to Docker Hub]
+        C --> D[Snyk scan]
+        D --> E[SonarCloud begin]
+        E --> F[Build + analysis]
+        F --> G[Run tests + coverage]
+        G --> H[SonarCloud end]
+        H --> I[Format check]
+        I --> J[Build image]
+        J --> K[Grype scan]
+        K --> L[Push to Docker Hub]
     end
 
     subgraph "Job 2: deploy-to-aks (CD)"
-        L[Azure login OIDC] --> M[Get AKS credentials]
-        M --> N[Deploy + rollout]
+        M[Azure login OIDC] --> N[Get AKS credentials]
+        N --> O[Deploy + rollout]
     end
 
-    K -->|"Solo en main"| L
+    L -->|"Solo en main"| M
 ```
 
 ### Job 1: build-and-test (CI)
@@ -161,13 +163,14 @@ Se ejecuta en **cada push y pull request**:
 | **Checkout** | Descarga el código con historial completo | SonarCloud necesita el historial para análisis incremental |
 | **Setup .NET + Java** | Instala SDK .NET 10 y Java 17 | SonarScanner requiere Java para ejecutarse |
 | **Restore** | Descarga paquetes NuGet | Separado del build para aprovechar cache |
+| **Snyk scan** | Escanea dependencias NuGet por vulnerabilidades conocidas | Detecta CVEs en paquetes de terceros antes de compilar. Complementa Grype (imagen) y SonarCloud (código) |
 | **SonarCloud begin** | Inicia análisis estático con SonarCloud | Envuelve el build para capturar información de análisis |
 | **Build** | Compila con analizadores Roslyn y --warnaserror | Detecta bugs, code smells y vulnerabilidades en compilación |
 | **Run tests + coverage** | Pruebas con xUnit y reporte de cobertura OpenCover | Valida lógica de negocio y mide cobertura de código |
 | **SonarCloud end** | Cierra y sube resultados a SonarCloud | Dashboard de calidad en sonarcloud.io |
 | **Format check** | Verifica formato con dotnet format | Asegura consistencia de estilo |
 | **Build image** | Construye imagen Docker multi-stage | Imagen final ~200MB vs ~800MB con SDK |
-| **Grype scan** | Escanea imagen por CVEs | Si encuentra vulnerabilidades críticas, la imagen no se publica |
+| **Grype scan** | Escanea imagen Docker por CVEs | Si encuentra vulnerabilidades críticas, la imagen no se publica |
 | **Push to Docker Hub** | Publica la imagen | Solo si todos los pasos anteriores pasaron |
 
 ### Job 2: deploy-to-aks (CD)
@@ -180,9 +183,21 @@ Se ejecuta **solo en la rama `main`** y solo si el Job 1 fue exitoso:
 | **Get AKS credentials** | Descarga el kubeconfig del cluster | Permite ejecutar comandos kubectl |
 | **Deploy to AKS** | Actualiza imagen y reinicia los pods | kubectl set image + rollout restart + rollout status |
 
+### Seguridad en el pipeline: 3 capas complementarias
+
+El pipeline implementa un modelo de seguridad por capas donde cada herramienta cubre un ámbito distinto:
+
+| Herramienta | Qué escanea | Cuándo actúa |
+|---|---|---|
+| **SonarCloud** | Tu código fuente (bugs, code smells, vulnerabilidades) | Durante el build |
+| **Snyk** | Tus dependencias (paquetes NuGet de terceros) | Después del restore, antes del build |
+| **Grype** | Tu imagen Docker (imagen base + runtime + dependencias del SO) | Después del build, antes del push |
+
+Esta separación garantiza que ningún vector de ataque pase sin ser revisado: el código propio, las librerías externas y la imagen final de despliegue.
+
 ### ¿Por qué Grype y no Trivy?
 
-En marzo de 2026, Trivy (Aqua Security) sufrió un ataque a la cadena de suministro (CVE-2026-33634) que comprometió GitHub Actions, binarios de release e imágenes Docker Hub. Los atacantes inyectaron malware que exfiltraba credenciales de CI/CD desde los runners. Se seleccionó **Grype** (Anchore) como alternativa segura.
+En marzo de 2026, Trivy (Aqua Security) sufrió un ataque a la cadena de suministro (CVE-2026-33634) que comprometió GitHub Actions, binarios de release e imágenes Docker Hub. Los atacantes inyectaron malware que exfiltraba credenciales de CI/CD desde los runners. Se seleccionó **Grype** (Anchore) como alternativa segura. Adicionalmente, se integró **Snyk** para escanear las dependencias del proyecto (paquetes NuGet). Mientras Grype escanea la imagen Docker completa, Snyk se enfoca específicamente en las dependencias del código fuente, proporcionando una segunda capa de análisis que cubre vulnerabilidades a nivel de librería.
 
 ## Dockerfile
 
@@ -281,8 +296,9 @@ dotnet test AppCicd.Tests/AppCicd.Tests.csproj --verbosity normal
 | Capa | Mecanismo | Descripción |
 |---|---|---|
 | **Código** | Analizadores Roslyn + SonarCloud | Detección de bugs, vulnerabilidades y code smells |
+| **Dependencias** | Snyk | Escaneo de vulnerabilidades en paquetes NuGet |
 | **Formato** | dotnet format | Consistencia de estilo |
-| **Imagen Docker** | Grype (Anchore) | Escaneo de CVEs en imagen base y dependencias |
+| **Imagen Docker** | Grype (Anchore) | Escaneo de CVEs en imagen base y dependencias del SO |
 | **Autenticación Azure** | OIDC Federation | Tokens temporales, sin contraseñas almacenadas |
 | **Service Principal** | RBAC (Contributor) | Menor privilegio, limitado a la suscripción |
 | **Secretos** | GitHub Secrets + Azure Key Vault | Encriptados, nunca en código |
@@ -299,6 +315,7 @@ dotnet test AppCicd.Tests/AppCicd.Tests.csproj --verbosity normal
 | Docker | Multi-stage | Contenerización de la aplicación |
 | GitHub Actions | v6 | Pipeline CI/CD automatizado |
 | SonarCloud | - | Análisis estático y cobertura de código |
+| Snyk | CLI | Escaneo de vulnerabilidades en dependencias |
 | Grype | v6 | Escaneo de vulnerabilidades de imágenes |
 | Azure AKS | Kubernetes 1.34 | Orquestación de contenedores |
 | Azure Monitor Prometheus | Managed | Recolección y almacenamiento de métricas |
